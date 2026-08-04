@@ -16,6 +16,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Cable
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.SystemUpdate
 import androidx.compose.material.icons.filled.Usb
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -23,6 +24,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -41,7 +43,7 @@ import com.marauder.mobile.usb.UsbSerialManager
 import com.marauder.mobile.vm.MarauderViewModel
 
 @Composable
-fun ConnectScreen(vm: MarauderViewModel) {
+fun ConnectScreen(vm: MarauderViewModel, onOpenFlash: () -> Unit) {
     val status by vm.status.collectAsState()
     val connecting = status == UsbSerialManager.Status.CONNECTING
     var devices by remember { mutableStateOf(vm.availableDevices()) }
@@ -98,6 +100,16 @@ fun ConnectScreen(vm: MarauderViewModel) {
                     LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
                     Text("Connecting…", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
+            }
+
+            OutlinedButton(
+                onClick = onOpenFlash,
+                enabled = !connecting,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Icon(Icons.Filled.SystemUpdate, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("Flash / update firmware")
             }
 
             Text(

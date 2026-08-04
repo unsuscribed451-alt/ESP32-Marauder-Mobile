@@ -9,7 +9,15 @@ import com.marauder.mobile.data.ListType
 import com.marauder.mobile.protocol.DeviceMessage
 import com.marauder.mobile.protocol.LineParser
 import com.marauder.mobile.protocol.ParsedLine
+import com.marauder.mobile.esp.EspFlasher
+import com.marauder.mobile.esp.Firmware
+import com.marauder.mobile.esp.FirmwareRepository
+import com.marauder.mobile.esp.FlashProfile
+import com.marauder.mobile.esp.FlashStage
+import com.marauder.mobile.esp.FlashUiState
+import com.marauder.mobile.esp.UsbFlashLink
 import com.marauder.mobile.usb.UsbSerialManager
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -84,6 +92,10 @@ class MarauderViewModel(application: Application) : AndroidViewModel(application
     private val _analyzer = MutableStateFlow(AnalyzerState())
     val analyzer: StateFlow<AnalyzerState> = _analyzer.asStateFlow()
 
+    // --- Firmware flashing ---------------------------------------------------
+    private val _flash = MutableStateFlow(FlashUiState())
+    val flash: StateFlow<FlashUiState> = _flash.asStateFlow()
+
     // --- One-shot messages ---------------------------------------------------
     private val _snackbar = MutableSharedFlow<String>(extraBufferCapacity = 16)
     val snackbar: SharedFlow<String> = _snackbar.asSharedFlow()
@@ -98,6 +110,7 @@ class MarauderViewModel(application: Application) : AndroidViewModel(application
     private var consoleSeq = 0L
     private var sessionJob: Job? = null
     private var liveJob: Job? = null
+    private var flashJob: Job? = null
 
     init {
         viewModelScope.launch { usb.lines.collect(::onLine) }
@@ -185,6 +198,63 @@ class MarauderViewModel(application: Application) : AndroidViewModel(application
 
     fun clearConsole() {
         _console.value = emptyList()
+    }
+
+    // --- Firmware flashing ---------------------------------------------------
+
+    /** USB serial adapters currently on the bus, offered as flash targets. */
+    fun availableFlashDevices(): List<UsbSerialManager.DeviceOption> = usb.availableDevices()
+
+    /** Clear a finished (done/failed) flash result so the screen returns to idle. */
+    fun resetFlashState() {
+        if (_flash.value.inProgress) return
+        _flash.value = FlashUiState()
+    }
+
+    /**
+     * Download the firmware for [profile] from the pinned GitHub release and flash it
+     * to [option] over USB. Frees the normal serial session first (the port can only
+     * be held once). Progress and the final result are published on [flash].
+     */
+    fun startFlash(option: UsbSerialManager.DeviceOption, profile: FlashProfile = Firmware.MARAUDER_V4) {
+        if (flashJob?.isActive == true) return
+        val app = getApplication<Application>()
+        flashJob = viewModelScope.launch(Dispatchers.IO) {
+            val link = UsbFlashLink(app, option.driver)
+            try {
+                setFlash(FlashStage.CONNECT, 0f, "Preparing…")
+                if (usb.status.value != UsbSerialManager.Status.DISCONNECTED) {
+                    usb.disconnect()
+                    delay(400)
+                }
+
+                val repo = FirmwareRepository()
+                val sums = repo.checksums()
+                val images = profile.parts.map { part ->
+                    setFlash(FlashStage.DOWNLOAD, 0f, "Downloading ${part.assetName}")
+                    val bytes = repo.download(part.assetName) { f ->
+                        setFlash(FlashStage.DOWNLOAD, f, "Downloading ${part.assetName} · ${(f * 100).toInt()}%")
+                    }
+                    sums[part.assetName]?.let { repo.verifySha256(part.assetName, bytes, it) }
+                    part.offset to bytes
+                }
+
+                setFlash(FlashStage.CONNECT, 0f, "Opening USB port…")
+                link.open()
+                EspFlasher(link).flash(images) { p -> setFlash(p.stage, p.fraction, p.message) }
+            } catch (e: Exception) {
+                setFlash(FlashStage.ERROR, _flash.value.fraction, e.message ?: "Flash failed")
+                _snackbar.tryEmit("Flash failed: ${e.message}")
+            } finally {
+                runCatching { link.close() }
+            }
+        }
+    }
+
+    private fun setFlash(stage: FlashStage, fraction: Float, message: String) {
+        val cur = _flash.value
+        val log = if (stage != cur.stage || cur.log.isEmpty()) (cur.log + message).takeLast(40) else cur.log
+        _flash.value = FlashUiState(stage, fraction, message, log)
     }
 
     // --- Incoming ------------------------------------------------------------

@@ -108,6 +108,9 @@ sealed interface MenuAction {
 
     /** Open the raw serial console. */
     data object OpenConsole : MenuAction
+
+    /** Open the firmware flasher / updater. */
+    data object OpenFlash : MenuAction
 }
 
 data class MenuItem(
@@ -144,6 +147,7 @@ object Catalog {
                     MenuItem("Bluetooth", "Sniffers · Attacks", Icons.Filled.Bluetooth, Accent.BLUETOOTH, MenuAction.Submenu("bluetooth")),
                     MenuItem("GPS", "Data · NMEA · Tracker · POI", Icons.Filled.MyLocation, Accent.GPS, MenuAction.Submenu("gps")),
                     MenuItem("Device", "Info · Files · Firmware", Icons.Filled.DeveloperBoard, Accent.DEVICE, MenuAction.Submenu("device")),
+                    MenuItem("Flash & Update", "Flash / update firmware", Icons.Filled.SystemUpdate, Accent.DEVICE, MenuAction.OpenFlash),
                     MenuItem("Reboot", "Restart the ESP32", Icons.Filled.RestartAlt, Accent.NEUTRAL, MenuAction.Send("reboot")),
                 ),
             ),

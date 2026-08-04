@@ -6,6 +6,9 @@
         android:name="android.hardware.usb.host"
         android:required="true" />
 
+    <!-- Firmware flashing downloads the release .bin images over HTTPS. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
     <application
         android:name=".MarauderApp"
         android:allowBackup="true"

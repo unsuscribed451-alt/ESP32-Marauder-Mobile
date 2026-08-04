@@ -29,6 +29,7 @@ import com.marauder.mobile.ui.screens.AboutScreen
 import com.marauder.mobile.ui.screens.AnalyzerScreen
 import com.marauder.mobile.ui.screens.ConnectScreen
 import com.marauder.mobile.ui.screens.ConsoleScreen
+import com.marauder.mobile.ui.screens.FlashScreen
 import com.marauder.mobile.ui.screens.ListScreen
 import com.marauder.mobile.ui.screens.LiveActivityScreen
 import com.marauder.mobile.ui.screens.MenuScreen
@@ -43,6 +44,7 @@ private object Routes {
     const val ANALYZER = "analyzer"
     const val LIVE = "live"
     const val ABOUT = "about"
+    const val FLASH = "flash"
     fun menu(id: String) = "$MENU/$id"
     fun list(type: ListType) = "$LIST/${type.name}"
     fun analyzer(kind: AnalyzerKind, command: String) = "$ANALYZER/${kind.name}/${Uri.encode(command)}"
@@ -64,7 +66,9 @@ fun AppRoot() {
     Box(Modifier.fillMaxSize()) {
         NavHost(navController = nav, startDestination = Routes.CONNECT) {
 
-            composable(Routes.CONNECT) { ConnectScreen(vm) }
+            composable(Routes.CONNECT) {
+                ConnectScreen(vm, onOpenFlash = { nav.navigate(Routes.FLASH) })
+            }
 
             composable(
                 route = "${Routes.MENU}/{id}",
@@ -97,6 +101,10 @@ fun AppRoot() {
 
             composable(Routes.ABOUT) {
                 AboutScreen(onBack = { nav.popBackStack() })
+            }
+
+            composable(Routes.FLASH) {
+                FlashScreen(vm = vm, onBack = { nav.popBackStack() })
             }
 
             composable(
@@ -150,7 +158,9 @@ private fun ConnectionGate(vm: MarauderViewModel, nav: NavHostController) {
                 }
             }
             UsbSerialManager.Status.DISCONNECTED -> {
-                if (currentRoute != null && currentRoute != Routes.CONNECT) {
+                // Don't yank the user off the flasher: it intentionally runs while the
+                // normal serial session is down (it holds the port itself).
+                if (currentRoute != null && currentRoute != Routes.CONNECT && currentRoute != Routes.FLASH) {
                     nav.navigate(Routes.CONNECT) {
                         popUpTo(0) { inclusive = true }
                         launchSingleTop = true
@@ -176,5 +186,6 @@ private fun handleAction(
         }
         is MenuAction.OpenAnalyzer -> nav.navigate(Routes.analyzer(action.kind, action.command))
         MenuAction.OpenConsole -> nav.navigate(Routes.CONSOLE)
+        MenuAction.OpenFlash -> nav.navigate(Routes.FLASH)
     }
 }
