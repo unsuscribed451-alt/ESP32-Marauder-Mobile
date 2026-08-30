@@ -15,6 +15,8 @@ import com.hoho.android.usbserial.driver.UsbSerialDriver
 import com.hoho.android.usbserial.driver.UsbSerialPort
 import com.hoho.android.usbserial.driver.UsbSerialProber
 import com.hoho.android.usbserial.util.SerialInputOutputManager
+import com.marauder.mobile.protocol.CaptureFrame
+import com.marauder.mobile.protocol.SerialDemux
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -25,7 +27,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import java.io.ByteArrayOutputStream
 
 /**
  * Owns the USB-OTG serial link to the ESP32 Marauder. Exposes incoming lines and
@@ -59,9 +60,20 @@ class UsbSerialManager(context: Context) {
     private val _events = MutableSharedFlow<String>(extraBufferCapacity = 64)
     val events: SharedFlow<String> = _events.asSharedFlow()
 
+    /** Binary pcap/log capture frames carved out of the serial stream (proto ≥ 2). */
+    private val _captureFrames = MutableSharedFlow<CaptureFrame>(extraBufferCapacity = 512)
+    val captureFrames: SharedFlow<CaptureFrame> = _captureFrames.asSharedFlow()
+
     private var port: UsbSerialPort? = null
     private var ioManager: SerialInputOutputManager? = null
-    private val lineBuf = ByteArrayOutputStream(512)
+
+    // Single point that separates text lines from binary capture frames. Only the
+    // serial reader thread touches it, so it needs no external synchronisation.
+    private val demux = SerialDemux(
+        onLine = { _lines.tryEmit(it) },
+        onFrame = { _captureFrames.tryEmit(it) },
+        onError = { emitEvent("Capture: $it") },
+    )
     private var pendingDriver: UsbSerialDriver? = null
     private var receiverRegistered = false
 
@@ -158,7 +170,7 @@ class UsbSerialManager(context: Context) {
                 runCatching { p.setDTR(true) }
                 runCatching { p.setRTS(true) }
 
-                synchronized(lineBuf) { lineBuf.reset() }
+                demux.reset()
                 val io = SerialInputOutputManager(p, listener)
                 io.start()
 
@@ -177,25 +189,22 @@ class UsbSerialManager(context: Context) {
 
     private val listener = object : SerialInputOutputManager.Listener {
         override fun onNewData(data: ByteArray) {
-            synchronized(lineBuf) {
-                for (b in data) {
-                    when (b.toInt()) {
-                        '\n'.code -> {
-                            val line = lineBuf.toString("UTF-8")
-                            lineBuf.reset()
-                            if (line.isNotEmpty()) _lines.tryEmit(line)
-                        }
-                        '\r'.code -> { /* drop CR */ }
-                        else -> lineBuf.write(b.toInt())
-                    }
-                }
-            }
+            demux.feed(data, data.size)
         }
 
         override fun onRunError(e: Exception) {
             emitEvent("Serial error: ${e.message}")
             disconnect()
         }
+    }
+
+    /**
+     * Change the line rate on the fly (used after the `jsonbaud` handshake to
+     * raise throughput for capture streaming). The ESP32 replies at the old rate
+     * and switches, so the caller invokes this only after seeing that reply.
+     */
+    fun setBaud(rate: Int) {
+        runCatching { port?.setParameters(rate, 8, UsbSerialPort.STOPBITS_1, UsbSerialPort.PARITY_NONE) }
     }
 
     /** Queue a command (a newline is appended). Written on the IO dispatcher. */

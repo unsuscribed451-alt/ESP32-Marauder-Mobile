@@ -4,8 +4,20 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.marauder.mobile.MarauderApp
+import com.marauder.mobile.capture.CaptureSink
 import com.marauder.mobile.data.AnalyzerKind
+import com.marauder.mobile.data.GpxAssembler
 import com.marauder.mobile.data.ListType
+import com.marauder.mobile.data.LiveClassifier
+import com.marauder.mobile.data.NmeaAssembler
+import com.marauder.mobile.data.WardriveAssembler
+import com.marauder.mobile.location.LocationRepository
+import kotlinx.coroutines.flow.collectLatest
+import java.io.BufferedOutputStream
+import java.io.File
+import java.io.FileOutputStream
+import java.io.OutputStream
+import com.marauder.mobile.protocol.CaptureFrame
 import com.marauder.mobile.protocol.DeviceMessage
 import com.marauder.mobile.protocol.LineParser
 import com.marauder.mobile.protocol.ParsedLine
@@ -43,10 +55,24 @@ data class AnalyzerState(
     val page: Int = 0,
 )
 
+/** Live state of an on-phone capture (pcap streamed to storage, or a wardrive CSV). */
+data class CaptureUiState(
+    val active: Boolean = false,
+    val path: String? = null,
+    val kind: String = "",          // "pcap" | "wardrive"
+    val bytes: Long = 0,
+    val missedFrames: Long = 0,     // gaps in the frame sequence (transport loss)
+    val droppedPackets: Long = 0,   // packets the device ring couldn't hold
+    val rows: Int = 0,              // wardrive rows written
+)
+
 class MarauderViewModel(application: Application) : AndroidViewModel(application) {
 
-    private val usb: UsbSerialManager = (application as MarauderApp).usb
-    private val settings = (application as MarauderApp).settings
+    private val app = application as MarauderApp
+    private val usb: UsbSerialManager = app.usb
+    private val settings = app.settings
+    private val captureSink: CaptureSink = app.captureSink
+    private val location: LocationRepository = app.location
 
     // --- Connection ----------------------------------------------------------
     val status: StateFlow<UsbSerialManager.Status> = usb.status
@@ -96,6 +122,25 @@ class MarauderViewModel(application: Application) : AndroidViewModel(application
     private val _flash = MutableStateFlow(FlashUiState())
     val flash: StateFlow<FlashUiState> = _flash.asStateFlow()
 
+    // --- On-phone capture (SD-card / GPS-module replacement) -----------------
+    private val _capture = MutableStateFlow(CaptureUiState())
+    val capture: StateFlow<CaptureUiState> = _capture.asStateFlow()
+
+    /** True once the connected firmware advertised the proto ≥ 2 "capstream" cap. */
+    private var captureCapable = false
+    private var negotiated = false
+    private var wardriving = false
+    private val wardriveSeen = HashSet<String>()
+
+    // Phone-GPS activities (each runs while its live screen is open; the SD-less
+    // board has no GPS module, so these are served from the phone's own GNSS).
+    private var gpsData = false      // gpsdata / nmea live console
+    private var gpsTracking = false  // gpstracker → GPX track file
+    private var poiOpen = false      // gpspoi session (persists across screens until -e)
+    private var poiOut: OutputStream? = null
+    private var poiPath: String? = null
+    private var poiCount = 0
+
     // --- One-shot messages ---------------------------------------------------
     private val _snackbar = MutableSharedFlow<String>(extraBufferCapacity = 16)
     val snackbar: SharedFlow<String> = _snackbar.asSharedFlow()
@@ -115,10 +160,27 @@ class MarauderViewModel(application: Application) : AndroidViewModel(application
     init {
         viewModelScope.launch { usb.lines.collect(::onLine) }
         viewModelScope.launch {
+            // Binary capture frames carved out of the serial stream: append each to
+            // the active capture file and keep the UI counters current.
+            usb.captureFrames.collect { frame ->
+                if (captureSink.isActive) {
+                    captureSink.write(frame)
+                    _capture.value = _capture.value.copy(
+                        bytes = captureSink.bytes,
+                        missedFrames = captureSink.missedFrames,
+                    )
+                }
+            }
+        }
+        viewModelScope.launch {
             usb.events.collect { msg ->
                 appendConsole(msg, LineKind.SYSTEM)
                 _snackbar.tryEmit(msg)
             }
+        }
+        viewModelScope.launch {
+            // While wardriving, turn each refreshed AP list into WigleWiFi rows.
+            aps.collect { if (wardriving) onWardriveAps(it) }
         }
         viewModelScope.launch {
             usb.status.collect { st ->
@@ -169,9 +231,37 @@ class MarauderViewModel(application: Application) : AndroidViewModel(application
     fun consoleMark(): Long = consoleSeq
 
     /** Run [command] and keep its live view fed: poll status (and its list, if any)
-     *  every ~1.3 s while it runs so counters and rows update in real time. */
+     *  every ~1.3 s while it runs so counters and rows update in real time.
+     *
+     *  When the firmware supports capstream (proto ≥ 2), a pcap-producing command
+     *  is streamed to phone storage (`-serial`) instead of the device SD card, and
+     *  `wardrive` is served entirely on the phone (AP list + phone GPS → CSV). */
     fun startLiveActivity(command: String, list: ListType?) {
-        runCommand(command)
+        val trimmed = command.trim()
+        val head = trimmed.substringBefore(' ')
+
+        if (head == "wardrive" && captureCapable) {
+            startWardrive(trimmed)
+            return
+        }
+        // GPS features are served from the phone's GNSS (the board has no module).
+        when (head) {
+            "gpsdata" -> { startGpsConsole(nmea = false); return }
+            "nmea" -> { startGpsConsole(nmea = true); return }
+            "gpstracker" -> { if (trimmed.contains("stop")) stopTracking() else startTracking(); return }
+            "gpspoi" -> { handlePoi(trimmed); return }
+        }
+
+        val capturing = LiveClassifier.of(trimmed).capture && captureCapable
+        if (capturing) {
+            val path = captureSink.begin(trimmed.substringBefore(' '), CaptureFrame.TYPE_PCAP)
+            _capture.value = CaptureUiState(active = true, path = path, kind = "pcap")
+        }
+
+        // Append -serial so the firmware streams the pcap to us over the wire.
+        appendConsole("> $trimmed", LineKind.INPUT)
+        usb.send(if (capturing) "$trimmed -serial" else trimmed)
+
         list?.let {
             bufferFor(it).clear()
             _listLoading.value = it
@@ -187,13 +277,219 @@ class MarauderViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
-    /** Leave a live screen: stop polling and, for continuous scans/attacks, stop the
-     *  firmware scan (mirrors pressing Back on the device). */
+    /** Leave a live screen: stop polling, close any capture, and for continuous
+     *  scans/attacks stop the firmware scan (mirrors pressing Back on the device). */
     fun stopLiveActivity(continuous: Boolean) {
         liveJob?.cancel()
         liveJob = null
         _listLoading.value = null
-        if (continuous) usb.send("stopscan")
+        if (wardriving) stopWardrive()
+        if (gpsTracking) { stopTracking(); return } // stopTracking closes the GPX + capture itself
+        if (gpsData) { gpsData = false; maybeStopLocation() }
+        if (captureSink.isActive) endCapture()
+        // A GPS-only screen (gpsdata/nmea/tracker/poi) never started a device scan,
+        // so only send stopscan for real device scans/attacks.
+        if (continuous && !gpsData) usb.send("stopscan")
+    }
+
+    // --- Location permission (requested from the live screen) ----------------
+
+    fun hasLocationPermission(): Boolean = location.hasPermission()
+
+    /** Called back after the runtime permission prompt: (re)start the GNSS for
+     *  whatever phone-GPS activity is currently running. */
+    fun onLocationPermissionResult(granted: Boolean) {
+        if (granted) {
+            if (wardriving || gpsData || gpsTracking || poiOpen) location.start()
+        } else {
+            _snackbar.tryEmit("Location permission denied — GPS features need it")
+        }
+    }
+
+    // --- Phone GPS: data / NMEA / tracker / POI ------------------------------
+
+    private fun startGpsConsole(nmea: Boolean) {
+        gpsData = true
+        val ok = location.start()
+        appendConsole("> ${if (nmea) "nmea" else "gpsdata"} (phone GPS)", LineKind.INPUT)
+        if (!ok) appendConsole("Grant the location permission and turn GPS on to see fixes.", LineKind.SYSTEM)
+        liveJob?.cancel()
+        liveJob = viewModelScope.launch {
+            while (isActive) {
+                val l = location.location.value
+                when {
+                    l == null -> {} // still waiting for a fix
+                    nmea -> {
+                        appendConsole(NmeaAssembler.gga(l), LineKind.OUTPUT)
+                        appendConsole(NmeaAssembler.rmc(l), LineKind.OUTPUT)
+                    }
+                    else -> appendConsole(
+                        "◈ ${"%.6f".format(l.lat)}, ${"%.6f".format(l.lon)} · " +
+                            "alt ${"%.1f".format(l.altMeters)} m · ±${"%.0f".format(l.accuracyMeters)} m",
+                        LineKind.OUTPUT,
+                    )
+                }
+                delay(1500)
+            }
+        }
+    }
+
+    private fun startTracking() {
+        gpsTracking = true
+        location.start()
+        val path = captureSink.begin("tracker", CaptureFrame.TYPE_GPX)
+        captureSink.appendBytes(GpxAssembler.TRACK_HEADER.toByteArray(Charsets.UTF_8))
+        _capture.value = CaptureUiState(active = true, path = path, kind = "gpx")
+        appendConsole("> gpstracker (phone GPS)", LineKind.INPUT)
+        liveJob?.cancel()
+        liveJob = viewModelScope.launch {
+            // One track point per fresh fix.
+            location.location.collectLatest { l ->
+                if (l != null && captureSink.isActive) {
+                    captureSink.appendBytes(GpxAssembler.trackPoint(l).toByteArray(Charsets.UTF_8))
+                    _capture.value = _capture.value.copy(bytes = captureSink.bytes, rows = _capture.value.rows + 1)
+                }
+            }
+        }
+    }
+
+    private fun stopTracking() {
+        gpsTracking = false
+        liveJob?.cancel(); liveJob = null
+        if (captureSink.isActive) {
+            captureSink.appendBytes(GpxAssembler.TRACK_FOOTER.toByteArray(Charsets.UTF_8))
+            endCapture()
+        }
+        maybeStopLocation()
+        appendConsole("Tracker stopped", LineKind.SYSTEM)
+    }
+
+    /** POI marking uses its own file (independent of [captureSink]) so it can span
+     *  screens: -s opens it, -m adds a waypoint, -e closes it. */
+    private fun handlePoi(cmd: String) {
+        location.start()
+        when {
+            cmd.contains("-e") -> closePoi()
+            cmd.contains("-m") -> {
+                openPoiIfNeeded()
+                val l = location.location.value
+                if (l == null) appendConsole("No GPS fix yet — POI not marked", LineKind.SYSTEM)
+                else {
+                    poiCount++
+                    runCatching { poiOut?.write(GpxAssembler.waypoint(l, "POI $poiCount").toByteArray(Charsets.UTF_8)) }
+                    appendConsole("POI #$poiCount marked at ${"%.6f".format(l.lat)}, ${"%.6f".format(l.lon)}", LineKind.SYSTEM)
+                }
+            }
+            else -> { openPoiIfNeeded(); appendConsole("POI session started (phone GPS)", LineKind.INPUT) }
+        }
+    }
+
+    private fun openPoiIfNeeded() {
+        if (poiOut != null) return
+        runCatching {
+            val dir = File(app.getExternalFilesDir(null), "captures").apply { mkdirs() }
+            var i = 0
+            var f: File
+            do { f = File(dir, "poi_$i.gpx"); i++ } while (f.exists())
+            poiOut = BufferedOutputStream(FileOutputStream(f)).also {
+                it.write(GpxAssembler.POI_HEADER.toByteArray(Charsets.UTF_8))
+            }
+            poiPath = f.absolutePath
+            poiCount = 0
+            poiOpen = true
+        }
+    }
+
+    private fun closePoi() {
+        val out = poiOut ?: run { appendConsole("No POI session open", LineKind.SYSTEM); return }
+        runCatching {
+            out.write(GpxAssembler.POI_FOOTER.toByteArray(Charsets.UTF_8))
+            out.flush(); out.close()
+        }
+        appendConsole("POI saved ($poiCount points): ${poiPath}", LineKind.SYSTEM)
+        _snackbar.tryEmit("POI saved: $poiPath")
+        poiOut = null; poiPath = null; poiOpen = false
+        maybeStopLocation()
+    }
+
+    /** Turn the GNSS off only when no phone-GPS activity still needs it. */
+    private fun maybeStopLocation() {
+        if (!wardriving && !gpsData && !gpsTracking && !poiOpen) location.stop()
+    }
+
+    // --- On-phone capture helpers --------------------------------------------
+
+    /** On the first proto ≥ 2 handshake, enable saving and raise the line rate so
+     *  captures stream to the phone fast enough to keep up. */
+    private fun negotiateCapture(info: DeviceMessage.Info) {
+        captureCapable = info.proto >= 2 || info.has("capstream")
+        if (!captureCapable || negotiated) return
+        negotiated = true
+        viewModelScope.launch {
+            usb.send("settings -s SavePCAP enable")
+            delay(150)
+            usb.send("jsonbaud $CAPTURE_BAUD") // setBaud() follows on the {"t":"baud"} reply
+        }
+    }
+
+    private fun endCapture() {
+        val summary = captureSink.end()
+        _capture.value = _capture.value.copy(
+            active = false,
+            path = summary?.path ?: _capture.value.path,
+            bytes = summary?.bytes ?: _capture.value.bytes,
+            missedFrames = summary?.missedFrames ?: _capture.value.missedFrames,
+        )
+        summary?.let { _snackbar.tryEmit("Capture saved: ${it.bytes} B → ${it.path}") }
+    }
+
+    /** Wardrive using the phone's GPS: run a continuous AP scan and write a
+     *  WigleWiFi CSV, tagging each newly-seen AP with the phone's current fix. */
+    private fun startWardrive(command: String) {
+        wardriving = true
+        wardriveSeen.clear()
+        val located = location.start()
+        // WigleWiFi content in a .log file — same as the official Marauder's
+        // /wardrive_N.log on SD (rename to .csv before a WiGLE upload).
+        val path = captureSink.beginFile("wardrive", "log")
+        captureSink.appendBytes(WardriveAssembler.header(APP_RELEASE).toByteArray(Charsets.UTF_8))
+        _capture.value = CaptureUiState(active = true, path = path, kind = "wardrive")
+        if (!located) _snackbar.tryEmit("Location permission/GPS off — rows will log without a fix")
+
+        appendConsole("> $command (phone GPS)", LineKind.INPUT)
+        usb.send("scanall")
+        apBuf.clear()
+        _listLoading.value = ListType.ACCESS_POINTS
+        liveJob?.cancel()
+        liveJob = viewModelScope.launch {
+            delay(500)
+            while (isActive && usb.status.value == UsbSerialManager.Status.CONNECTED) {
+                usb.send("jsonstatus")
+                usb.send("jsonlist a")
+                delay(1300)
+            }
+        }
+    }
+
+    private fun stopWardrive() {
+        wardriving = false
+        maybeStopLocation()
+    }
+
+    /** Append a WigleWiFi row for every AP seen for the first time this session. */
+    private fun onWardriveAps(list: List<DeviceMessage.Ap>) {
+        val loc = location.location.value
+        var added = 0
+        for (ap in list) {
+            if (ap.bssid.isBlank()) continue
+            if (wardriveSeen.add(ap.bssid)) {
+                captureSink.appendBytes(WardriveAssembler.line(ap, loc).toByteArray(Charsets.UTF_8))
+                added++
+            }
+        }
+        if (added > 0) {
+            _capture.value = _capture.value.copy(bytes = captureSink.bytes, rows = wardriveSeen.size)
+        }
     }
 
     fun clearConsole() {
@@ -216,7 +512,7 @@ class MarauderViewModel(application: Application) : AndroidViewModel(application
      * to [option] over USB. Frees the normal serial session first (the port can only
      * be held once). Progress and the final result are published on [flash].
      */
-    fun startFlash(option: UsbSerialManager.DeviceOption, profile: FlashProfile = Firmware.MARAUDER_V4) {
+    fun startFlash(option: UsbSerialManager.DeviceOption, profile: FlashProfile = Firmware.DEFAULT) {
         if (flashJob?.isActive == true) return
         val app = getApplication<Application>()
         flashJob = viewModelScope.launch(Dispatchers.IO) {
@@ -274,10 +570,22 @@ class MarauderViewModel(application: Application) : AndroidViewModel(application
                     "◈ ${msg.board} · fw ${msg.fw} · proto ${msg.proto} · [${msg.caps.joinToString(", ")}]",
                     LineKind.SYSTEM,
                 )
+                negotiateCapture(msg)
             }
             is DeviceMessage.Status -> _deviceStatus.value = msg
             is DeviceMessage.JsonMode ->
                 appendConsole("JSON mode ${if (msg.on) "enabled" else "disabled"}", LineKind.SYSTEM)
+            is DeviceMessage.Baud -> {
+                // The device confirmed the new rate (sent at the OLD rate) and has
+                // switched; match it so the faster link is used from here on.
+                usb.setBaud(msg.rate)
+                appendConsole("Serial rate → ${msg.rate} baud", LineKind.SYSTEM)
+            }
+            is DeviceMessage.Drop -> {
+                _capture.value = _capture.value.copy(
+                    droppedPackets = _capture.value.droppedPackets + msg.n,
+                )
+            }
             is DeviceMessage.Ap -> apBuf.add(msg)
             is DeviceMessage.Sta -> staBuf.add(msg)
             is DeviceMessage.SsidRow -> ssidBuf.add(msg)
@@ -352,6 +660,15 @@ class MarauderViewModel(application: Application) : AndroidViewModel(application
         _airtags.value = emptyList()
         _analyzer.value = AnalyzerState()
         _listLoading.value = null
+        // Close any device-fed capture and reset per-connection negotiation. Phone
+        // GPS activities (tracker/POI) are independent of the device link, so leave
+        // them running; only drop the GNSS if nothing still needs it.
+        if (captureSink.isActive && !gpsTracking) captureSink.end()
+        wardriving = false
+        maybeStopLocation()
+        negotiated = false
+        captureCapable = false
+        if (!gpsTracking) _capture.value = CaptureUiState()
     }
 
     // --- Helpers -------------------------------------------------------------
@@ -372,5 +689,11 @@ class MarauderViewModel(application: Application) : AndroidViewModel(application
     companion object {
         private const val MAX_CONSOLE = 800
         private const val MAX_SAMPLES = 120
+
+        // Line rate requested after the capstream handshake. 921600 is reliable on
+        // every common UART bridge (CP2102/CH340/FTDI) and ignored (harmlessly) by
+        // native-USB CDC boards, which already run at USB speed.
+        private const val CAPTURE_BAUD = 921600
+        private const val APP_RELEASE = "marauder-mobile"
     }
 }

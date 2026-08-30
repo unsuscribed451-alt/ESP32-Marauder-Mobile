@@ -30,6 +30,13 @@ sealed interface DeviceMessage {
 
     data class JsonMode(val on: Boolean) : DeviceMessage
 
+    /** Confirms a `jsonbaud` line-rate change; sent at the OLD rate, then the
+     *  device switches, so the host re-opens its port at [rate] on receipt. */
+    data class Baud(val rate: Int) : DeviceMessage
+
+    /** Reports packets the device's capture ring dropped since the last flush. */
+    data class Drop(val n: Long) : DeviceMessage
+
     data class Ap(
         val index: Int,
         val channel: Int,

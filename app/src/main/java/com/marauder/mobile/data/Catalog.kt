@@ -315,6 +315,7 @@ object Catalog {
             MenuScreen(
                 "gps", "GPS",
                 listOf(
+                    MenuItem("Wardrive", "WiFi + GPS → CSV on phone", Icons.Filled.Radar, Accent.GPS, MenuAction.Send("wardrive")),
                     MenuItem("GPS Data", "gpsdata", Icons.Filled.MyLocation, Accent.GPS, MenuAction.Send("gpsdata")),
                     MenuItem("NMEA Stream", "nmea", Icons.Filled.Satellite, Accent.GPS, MenuAction.Send("nmea")),
                     MenuItem("GPS Tracker", "gpstracker -c start", Icons.Filled.Route, Accent.GPS, MenuAction.Send("gpstracker -c start")),

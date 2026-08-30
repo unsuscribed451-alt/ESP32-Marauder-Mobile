@@ -175,8 +175,8 @@ object EspProtocol {
 }
 
 /**
- * The byte transport [EspFlasher] drives. Abstracts the Android USB serial port so
- * the protocol logic stays free of platform types (and unit-testable).
+ * The byte transport [EspFlasher] drives. Abstracts the platform serial port so the
+ * protocol logic stays free of platform types (and unit-testable).
  */
 interface SerialLink {
     /** Write all of [data] (blocking, with an internal timeout). */

@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -49,6 +50,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.marauder.mobile.esp.Firmware
+import com.marauder.mobile.esp.FlashProfile
 import com.marauder.mobile.esp.FlashStage
 import com.marauder.mobile.esp.FlashUiState
 import com.marauder.mobile.ui.components.EmptyState
@@ -66,6 +68,8 @@ fun FlashScreen(vm: MarauderViewModel, onBack: () -> Unit) {
     val flash by vm.flash.collectAsState()
     var devices by remember { mutableStateOf(vm.availableFlashDevices()) }
     var confirmTarget by remember { mutableStateOf<UsbSerialManager.DeviceOption?>(null) }
+    var selected by remember { mutableStateOf(Firmware.DEFAULT) }
+    var showPicker by remember { mutableStateOf(false) }
 
     Scaffold(
         topBar = {
@@ -97,7 +101,6 @@ fun FlashScreen(vm: MarauderViewModel, onBack: () -> Unit) {
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
             FirmwareSourceCard()
-            BootModeNote()
 
             when {
                 flash.inProgress -> ProgressCard(flash)
@@ -112,10 +115,16 @@ fun FlashScreen(vm: MarauderViewModel, onBack: () -> Unit) {
                         devices = vm.availableFlashDevices()
                     },
                 )
-                else -> DevicePicker(
-                    devices = devices,
-                    onFlash = { confirmTarget = it },
-                )
+                else -> {
+                    BoardSelectorCard(selected = selected, onClick = { showPicker = true })
+                    SelectionNote()
+                    BootModeNote()
+                    DevicePicker(
+                        devices = devices,
+                        selected = selected,
+                        onFlash = { confirmTarget = it },
+                    )
+                }
             }
 
             if (flash.log.isNotEmpty()) FlashLog(flash.log)
@@ -130,19 +139,27 @@ fun FlashScreen(vm: MarauderViewModel, onBack: () -> Unit) {
             text = {
                 Text(
                     "This erases the current firmware on \"${target.title}\" and writes " +
-                        "${Firmware.MARAUDER_V4.label} (${Firmware.TAG}). Keep the cable connected " +
+                        "${selected.label} (${Firmware.TAG}). Keep the cable connected " +
                         "until it finishes.",
                 )
             },
             confirmButton = {
                 Button(onClick = {
                     confirmTarget = null
-                    vm.startFlash(target)
+                    vm.startFlash(target, selected)
                 }) { Text("Flash") }
             },
             dismissButton = {
                 TextButton(onClick = { confirmTarget = null }) { Text("Cancel") }
             },
+        )
+    }
+
+    if (showPicker) {
+        BoardPickerDialog(
+            selected = selected,
+            onPick = { selected = it; showPicker = false },
+            onDismiss = { showPicker = false },
         )
     }
 }
@@ -158,9 +175,115 @@ private fun FirmwareSourceCard() {
             Icon(Icons.Filled.SystemUpdate, contentDescription = null, tint = CatDevice, modifier = Modifier.size(30.dp))
             Column(Modifier.weight(1f).padding(start = 12.dp)) {
                 Text("ESP32 Marauder firmware", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurface, fontWeight = FontWeight.SemiBold)
-                Text("Target: ${Firmware.MARAUDER_V4.label} · ${Firmware.TAG}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("Source: 0xsys fork · ${Firmware.TAG}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Text(Firmware.RELEASE_PAGE, style = MaterialTheme.typography.labelSmall, color = MarauderTextDim)
             }
+        }
+    }
+}
+
+/** Shows the chosen board and opens the picker. */
+@Composable
+private fun BoardSelectorCard(selected: FlashProfile, onClick: () -> Unit) {
+    Surface(
+        shape = RoundedCornerShape(16.dp),
+        color = MaterialTheme.colorScheme.surface,
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick),
+    ) {
+        Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Filled.DeveloperBoard, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(30.dp))
+            Column(Modifier.weight(1f).padding(horizontal = 12.dp)) {
+                Text("Board", style = MaterialTheme.typography.labelMedium, color = MarauderTextDim)
+                Text("${selected.label}  ·  ${selected.chip.label}", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurface, fontWeight = FontWeight.SemiBold)
+                Text(selected.hardware, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            Text("Change", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+        }
+    }
+}
+
+/** Guidance for picking the right binary for common hardware. */
+@Composable
+private fun SelectionNote() {
+    Surface(
+        shape = RoundedCornerShape(12.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text("Which one do I pick?", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurface, fontWeight = FontWeight.SemiBold)
+            Text(
+                "• Plain ESP32 (WROOM-32, NodeMCU, Wemos, generic dev board): choose \"Generic ESP32 (WROOM)\".\n" +
+                    "• A named Marauder board (v4/v6/v7, Kit, Mini, CYD, M5StickC…): choose that exact board.\n" +
+                    "• ESP32-S3 (generic dev board): choose \"Generic ESP32-S3\"; for a Cardputer pick the Cardputer entry.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                "In-app flashing works for classic ESP32 only. For ESP32-S2/S3/C5/C6 boards, pick the " +
+                    "binary here for reference and flash it with the web installer or esptool (their USB-JTAG " +
+                    "bootloader needs a different reset).",
+                style = MaterialTheme.typography.labelSmall,
+                color = MarauderTextDim,
+            )
+        }
+    }
+}
+
+/** Full-catalog board picker: classic ESP32 boards first (flashable in-app), then
+ *  the other chip families (reference / web-installer). */
+@Composable
+private fun BoardPickerDialog(
+    selected: FlashProfile,
+    onPick: (FlashProfile) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Select your board") },
+        text = {
+            Column(
+                Modifier.heightIn(max = 460.dp).verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                PickerSection("Classic ESP32 · flash in-app")
+                Firmware.PROFILES.filter { it.flashableInApp }.forEach {
+                    BoardRow(it, it.id == selected.id, onPick)
+                }
+                PickerSection("Other chips · use the web installer")
+                Firmware.PROFILES.filterNot { it.flashableInApp }.forEach {
+                    BoardRow(it, it.id == selected.id, onPick)
+                }
+            }
+        },
+        confirmButton = {},
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+    )
+}
+
+@Composable
+private fun PickerSection(title: String) {
+    Text(
+        title,
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.primary,
+        modifier = Modifier.padding(top = 10.dp, bottom = 2.dp),
+    )
+}
+
+@Composable
+private fun BoardRow(profile: FlashProfile, isSelected: Boolean, onPick: (FlashProfile) -> Unit) {
+    Surface(
+        shape = RoundedCornerShape(10.dp),
+        color = if (isSelected) MaterialTheme.colorScheme.primary.copy(alpha = 0.14f) else MaterialTheme.colorScheme.surfaceVariant,
+        modifier = Modifier.fillMaxWidth().clickable { onPick(profile) },
+    ) {
+        Row(Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("${profile.label}  ·  ${profile.chip.label}", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurface, fontWeight = FontWeight.SemiBold)
+                Text(profile.hardware, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            if (isSelected) Icon(Icons.Filled.CheckCircle, contentDescription = "Selected", tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp))
         }
     }
 }
@@ -191,6 +314,7 @@ private fun BootModeNote() {
 @Composable
 private fun DevicePicker(
     devices: List<UsbSerialManager.DeviceOption>,
+    selected: FlashProfile,
     onFlash: (UsbSerialManager.DeviceOption) -> Unit,
 ) {
     Surface(
@@ -200,6 +324,16 @@ private fun DevicePicker(
     ) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text("Select a device to flash", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurface)
+
+            if (!selected.flashableInApp) {
+                Text(
+                    "\"${selected.label}\" is an ${selected.chip.label} board — in-app flashing isn't " +
+                        "available for it yet. Flash the downloaded binary with the web installer or esptool.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Warning,
+                )
+            }
+
             if (devices.isEmpty()) {
                 EmptyState(
                     icon = Icons.Filled.Usb,
@@ -219,7 +353,7 @@ private fun DevicePicker(
                                 Text(device.title, style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurface, fontWeight = FontWeight.SemiBold)
                                 Text(device.subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
-                            Button(onClick = { onFlash(device) }) { Text("Flash") }
+                            Button(onClick = { onFlash(device) }, enabled = selected.flashableInApp) { Text("Flash") }
                         }
                     }
                 }

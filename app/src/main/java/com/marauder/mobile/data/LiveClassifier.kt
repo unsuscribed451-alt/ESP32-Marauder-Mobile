@@ -6,7 +6,7 @@ package com.marauder.mobile.data
  *  - [continuous]: true for scans/sniffs/attacks/streams (show a Stop control and stop the
  *    scan when leaving the screen); false for one‑shot commands that just print a reply.
  */
-data class LiveSpec(val list: ListType?, val continuous: Boolean) {
+data class LiveSpec(val list: ListType?, val continuous: Boolean, val capture: Boolean = false) {
     val isList: Boolean get() = list != null
 }
 
@@ -32,6 +32,9 @@ object LiveClassifier {
             head == "pingscan" || head == "arpscan" -> ListType.IPS
             else -> null
         }
-        return LiveSpec(list = list, continuous = head in continuousHeads)
+        // Commands that write a pcap/log the firmware would normally save to SD.
+        // With proto ≥ 2 these are streamed to the phone and saved there instead.
+        val capture = head.startsWith("sniff") || head == "wardrive"
+        return LiveSpec(list = list, continuous = head in continuousHeads, capture = capture)
     }
 }

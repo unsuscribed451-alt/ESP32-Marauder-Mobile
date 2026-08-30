@@ -1,5 +1,8 @@
 package com.marauder.mobile.ui.screens
 
+import android.Manifest
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -41,6 +44,7 @@ import com.marauder.mobile.ui.theme.Danger
 import com.marauder.mobile.ui.theme.MarauderCyan
 import com.marauder.mobile.ui.theme.MarauderTextDim
 import com.marauder.mobile.usb.UsbSerialManager
+import com.marauder.mobile.vm.CaptureUiState
 import com.marauder.mobile.vm.ConsoleEntry
 import com.marauder.mobile.vm.LineKind
 import com.marauder.mobile.vm.MarauderViewModel
@@ -57,6 +61,19 @@ fun LiveActivityScreen(
     val spec = remember(command) { LiveClassifier.of(command) }
     val mark = remember(command) { vm.consoleMark() }
 
+    // GPS features use the phone's GNSS, which needs a runtime permission grant.
+    val needsLocation = remember(command) {
+        command.trim().substringBefore(' ') in setOf("wardrive", "gpsdata", "nmea", "gpstracker", "gpspoi")
+    }
+    val locationPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted -> vm.onLocationPermissionResult(granted) }
+    LaunchedEffect(command) {
+        if (needsLocation && !vm.hasLocationPermission()) {
+            locationPermission.launch(Manifest.permission.ACCESS_FINE_LOCATION)
+        }
+    }
+
     DisposableEffect(command) {
         vm.startLiveActivity(command, spec.list)
         onDispose { vm.stopLiveActivity(spec.continuous) }
@@ -66,6 +83,7 @@ fun LiveActivityScreen(
     val connName by vm.connectedName.collectAsState()
     val devStatus by vm.deviceStatus.collectAsState()
     val console by vm.console.collectAsState()
+    val capture by vm.capture.collectAsState()
     val output = console.filter { it.id >= mark }
 
     var tab by remember { mutableIntStateOf(0) }
@@ -109,6 +127,10 @@ fun LiveActivityScreen(
                 modifier = Modifier.padding(horizontal = 20.dp, vertical = 2.dp),
             )
 
+            if (capture.active || capture.bytes > 0) {
+                CaptureBanner(capture)
+            }
+
             if (spec.isList) {
                 TabRow(selectedTabIndex = tab, containerColor = MaterialTheme.colorScheme.background) {
                     Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("Live") })
@@ -125,6 +147,31 @@ fun LiveActivityScreen(
                 OutputPane(output, modifier = Modifier.fillMaxSize())
             }
         }
+    }
+}
+
+/** Compact banner showing the on-phone capture (SD-card replacement) progress. */
+@Composable
+private fun CaptureBanner(state: CaptureUiState) {
+    val kb = state.bytes / 1024.0
+    val name = state.path?.substringAfterLast('/') ?: "capture"
+    Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 2.dp)) {
+        Text(
+            text = (if (state.active) "● REC  " else "■ saved  ") + name,
+            style = MaterialTheme.typography.labelMedium,
+            color = if (state.active) Danger else MarauderTextDim,
+        )
+        Text(
+            text = buildString {
+                append("%.1f KB".format(kb))
+                if (state.rows > 0) append(" · ${state.rows} rows")
+                if (state.missedFrames > 0) append(" · ${state.missedFrames} missed")
+                if (state.droppedPackets > 0) append(" · ${state.droppedPackets} dropped")
+            },
+            style = MaterialTheme.typography.labelSmall,
+            fontFamily = FontFamily.Monospace,
+            color = MarauderTextDim,
+        )
     }
 }
 

@@ -67,6 +67,10 @@ object LineParser {
 
             "jsonmode" -> DeviceMessage.JsonMode(on = obj.bool("on"))
 
+            "baud" -> DeviceMessage.Baud(rate = obj.int("rate"))
+
+            "drop" -> DeviceMessage.Drop(n = obj.long("n"))
+
             "ap" -> DeviceMessage.Ap(
                 index = obj.int("i"),
                 channel = obj.int("ch"),

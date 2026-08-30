@@ -9,6 +9,13 @@
     <!-- Firmware flashing downloads the release .bin images over HTTPS. -->
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!-- Wardriving tags each AP with the phone's own GPS fix, replacing the
+         optional ESP32 GPS module. GPS hardware is not required to run the app. -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-feature
+        android:name="android.hardware.location.gps"
+        android:required="false" />
+
     <application
         android:name=".MarauderApp"
         android:allowBackup="true"
